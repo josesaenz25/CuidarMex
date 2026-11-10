@@ -1,6 +1,7 @@
+import os
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -16,15 +17,42 @@ from schemas import (
     TrainingCourseCreate,
 )
 
-app = FastAPI()
+# ---------- CONFIGURACIÓN DE SEGURIDAD (variables de entorno) ----------
+# ENTORNO=produccion  -> apaga /docs, /redoc y /openapi.json (no exponer el mapa de la API)
+# ALLOWED_ORIGINS     -> URL(s) de la app web separadas por coma, p. ej.
+#                        https://cuidarmex-app.onrender.com
+#                        Si no se define, permite todo (solo para desarrollo).
+EN_PRODUCCION = os.environ.get("ENTORNO", "desarrollo").lower() == "produccion"
+
+ORIGENES = [
+    o.strip()
+    for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")
+    if o.strip()
+] or ["*"]
+
+app = FastAPI(
+    docs_url=None if EN_PRODUCCION else "/docs",
+    redoc_url=None,
+    openapi_url=None if EN_PRODUCCION else "/openapi.json",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ORIGENES,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def cabeceras_de_seguridad(request: Request, call_next):
+    """Evita que el navegador o un proxy guarden en caché datos de pacientes."""
+    respuesta = await call_next(request)
+    respuesta.headers["Cache-Control"] = "no-store"
+    respuesta.headers["X-Content-Type-Options"] = "nosniff"
+    respuesta.headers["Referrer-Policy"] = "no-referrer"
+    return respuesta
+
 
 # Umbrales del semáforo de cobertura (déficit = solicitudes pendientes - cuidadores)
 UMBRAL_ROJO = 3
@@ -60,6 +88,52 @@ def semaforo_de(deficit: int) -> str:
     if deficit >= UMBRAL_AMARILLO:
         return "Amarillo"
     return "Verde"
+
+
+# =========================
+# PRIVACIDAD: ENMASCARADO DE DATOS DEL PACIENTE
+# =========================
+
+_PARTICULAS = {"de", "del", "la", "las", "los", "y", "e"}
+
+
+def _palabras(nombre) -> list:
+    return [p for p in str(nombre or "").strip().split() if p]
+
+
+def iniciales(nombre) -> str:
+    """'María Flores González' -> 'M. F. G.'  (para quien solo ve la oferta)"""
+    letras = [
+        p[0].upper() + "."
+        for p in _palabras(nombre)
+        if p.lower() not in _PARTICULAS
+    ]
+    return " ".join(letras) or "Paciente"
+
+
+def nombre_corto(nombre) -> str:
+    """'María Flores González' -> 'María F.'  (para el cuidador ya asignado)"""
+    palabras = [p for p in _palabras(nombre) if p.lower() not in _PARTICULAS]
+    if not palabras:
+        return "Paciente"
+    primero = palabras[0].capitalize()
+    if len(palabras) == 1:
+        return primero
+    return f"{primero} {palabras[1][0].upper()}."
+
+
+def rango_edad(edad) -> str:
+    """72 -> '70-79' ; 9 -> 'Menor de 18'. Sin unidad: la pantalla ya agrega 'años'."""
+    try:
+        e = int(edad)
+    except (TypeError, ValueError):
+        return "No especificada"
+    if e < 18:
+        return "Menor de 18"
+    if e < 20:
+        return "18-19"
+    base = (e // 10) * 10
+    return f"{base}-{base + 9}"
 
 
 def validar_alcaldia(alcaldia: str):
@@ -224,7 +298,6 @@ def obtener_solicitudes(db: Session = Depends(get_db)):
             r.service_type AS servicio,
             r.status AS estado,
             r.request_date AS fecha,
-            r.paciente,
             r.alcaldia,
             r.caregiver_id,
             sr.estrellas
@@ -635,6 +708,13 @@ def obtener_oportunidades(db: Session = Depends(get_db)):
         WHERE status = 'Pendiente'
         ORDER BY id DESC
     """)
+
+    # Quien solo está viendo la oferta NO necesita identificar al paciente.
+    for d in datos:
+        d["paciente"] = iniciales(d["paciente"])
+        d["edad"] = rango_edad(d["edad"])
+        d["estado_salud"] = "Se comparte al ser asignado"
+
     return {"datos": datos}
 
 
@@ -872,6 +952,11 @@ def assigned_services(db: Session = Depends(get_db)):
         WHERE r.status = 'Asignada'
         ORDER BY r.id DESC
     """)
+
+    # Cuidador asignado: nombre de pila + inicial; nunca el nombre completo.
+    for d in datos:
+        d["paciente"] = nombre_corto(d["paciente"])
+
     return {"datos": datos}
 
 
