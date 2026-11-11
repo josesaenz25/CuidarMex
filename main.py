@@ -29,6 +29,7 @@ from schemas import (
     ActivoUpdate,
     ApplicationCreate,
     CaregiverCreate,
+    CaregiverUpdate,
     ConsentCreate,
     LoginCreate,
     RatingCreate,
@@ -519,10 +520,38 @@ def registrar_consentimiento(
 
 @app.get("/caregivers")
 def obtener_cuidadores(
+    q: Optional[str] = Query(None, max_length=60),
+    alcaldia: Optional[str] = Query(None, max_length=80),
+    especialidad: Optional[str] = Query(None, max_length=100),
+    orden: str = Query("calificacion", pattern="^(calificacion|costo|nombre)$"),
+    limite: int = Query(30, ge=1, le=100),
+    desde: int = Query(0, ge=0, le=100000),
     u: dict = Depends(requiere("familia", "admin")),
     db: Session = Depends(get_db),
 ):
-    datos = consulta(db, """
+    """Listado con búsqueda, filtros y paginación (hay cientos de cuidadores)."""
+    condiciones, params = [], {"limite": limite, "desde": desde}
+    if q and q.strip():
+        buscado = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        condiciones.append("nombre ILIKE :q ESCAPE '\\'")
+        params["q"] = f"%{buscado}%"
+    if alcaldia:
+        condiciones.append("alcaldia = :alcaldia")
+        params["alcaldia"] = alcaldia
+    if especialidad:
+        condiciones.append("especialidad = :especialidad")
+        params["especialidad"] = especialidad
+    donde = ("WHERE " + " AND ".join(condiciones)) if condiciones else ""
+
+    ordenes = {
+        "calificacion": "(COALESCE(total_resenas, 0) > 0) DESC, calificacion DESC, "
+                        "COALESCE(total_resenas, 0) DESC, id",
+        "costo": "costo_hora ASC, id",
+        "nombre": "nombre ASC, id",
+    }
+
+    total = valor(db, f"SELECT COUNT(*) FROM caregivers {donde}", params)
+    datos = consulta(db, f"""
         SELECT
             id,
             nombre,
@@ -533,14 +562,16 @@ def obtener_cuidadores(
             COALESCE(total_resenas, 0) AS total_resenas,
             alcaldia
         FROM caregivers
-        ORDER BY id
-    """)
+        {donde}
+        ORDER BY {ordenes[orden]}
+        LIMIT :limite OFFSET :desde
+    """, params)
 
     for d in datos:
         d["costo_hora"] = float(d["costo_hora"] or 0)
         d["calificacion"] = float(d["calificacion"] or 0)
 
-    return {"datos": datos}
+    return {"total": total, "datos": datos}
 
 
 @app.post("/caregivers")
@@ -1443,13 +1474,15 @@ def map_markers(u: dict = Depends(usuario_actual), db: Session = Depends(get_db)
     decimales_solicitud = 5 if es_admin else 2
 
     solicitudes = consulta(db, """
-        SELECT id, alcaldia, latitud, longitud
+        SELECT id, alcaldia, latitud, longitud, paciente,
+               service_type AS servicio, prioridad, status AS estado
         FROM requests
         WHERE latitud IS NOT NULL AND longitud IS NOT NULL
           AND status <> 'Completado'
     """)
     cuidadores = consulta(db, """
-        SELECT id, nombre, alcaldia, latitud, longitud
+        SELECT id, nombre, alcaldia, latitud, longitud, especialidad,
+               calificacion, COALESCE(total_resenas, 0) AS total_resenas
         FROM caregivers
         WHERE latitud IS NOT NULL AND longitud IS NOT NULL
     """)
@@ -1457,10 +1490,13 @@ def map_markers(u: dict = Depends(usuario_actual), db: Session = Depends(get_db)
     for s in solicitudes:
         s["latitud"] = round(float(s["latitud"]), decimales_solicitud)
         s["longitud"] = round(float(s["longitud"]), decimales_solicitud)
+        # En el mapa el paciente SOLO aparece con iniciales, incluso para el admin.
+        s["paciente"] = iniciales(s["paciente"])
 
     for c in cuidadores:
         c["latitud"] = round(float(c["latitud"]), 3)
         c["longitud"] = round(float(c["longitud"]), 3)
+        c["calificacion"] = float(c["calificacion"] or 0)
         if u["rol"] == "cuidador":
             c["nombre"] = nombre_corto(c["nombre"])
 
@@ -1581,6 +1617,103 @@ def admin_pacientes(
     db.commit()
 
     return {"total": total, "datos": datos}
+
+
+def _recalcular_calificacion(db: Session, caregiver_id: int):
+    r = consulta(db, """
+        SELECT ROUND(AVG(estrellas)::numeric, 1) AS promedio, COUNT(*) AS total
+        FROM service_ratings WHERE caregiver_id = :c
+    """, {"c": caregiver_id})[0]
+    db.execute(
+        text("UPDATE caregivers SET calificacion = :p, total_resenas = :t WHERE id = :c"),
+        {"p": r["promedio"] or 0, "t": r["total"], "c": caregiver_id},
+    )
+
+
+@app.put("/admin/caregivers/{caregiver_id}")
+def admin_editar_cuidador(
+    caregiver_id: int,
+    cambios: CaregiverUpdate,
+    u: dict = Depends(requiere("admin")),
+    db: Session = Depends(get_db),
+):
+    datos = {k: v for k, v in cambios.model_dump().items() if v is not None}
+    if not datos:
+        raise HTTPException(status_code=422, detail="No enviaste ningún cambio")
+    if "alcaldia" in datos:
+        validar_alcaldia(datos["alcaldia"])
+    for k in ("nombre", "experiencia"):
+        if k in datos:
+            datos[k] = datos[k].strip()
+    if valor(db, "SELECT id FROM caregivers WHERE id = :id", {"id": caregiver_id}) is None:
+        raise HTTPException(status_code=404, detail="Cuidador no encontrado")
+
+    # Los nombres de columna salen de una lista fija (nunca del cliente).
+    columnas = [c for c in ("nombre", "experiencia", "costo_hora", "especialidad", "alcaldia") if c in datos]
+    asignaciones = ", ".join(f"{c} = :{c}" for c in columnas)
+    db.execute(
+        text(f"UPDATE caregivers SET {asignaciones} WHERE id = :id"),
+        {**{c: datos[c] for c in columnas}, "id": caregiver_id},
+    )
+    auditar(db, "EDITAR", "caregivers", caregiver_id, u["id"])
+    db.commit()
+    return {"mensaje": "Cuidador actualizado"}
+
+
+@app.delete("/admin/caregivers/{caregiver_id}")
+def admin_borrar_cuidador(
+    caregiver_id: int,
+    u: dict = Depends(requiere("admin")),
+    db: Session = Depends(get_db),
+):
+    if valor(db, "SELECT id FROM caregivers WHERE id = :id", {"id": caregiver_id}) is None:
+        raise HTTPException(status_code=404, detail="Cuidador no encontrado")
+
+    servicios = valor(
+        db, "SELECT COUNT(*) FROM requests WHERE caregiver_id = :id", {"id": caregiver_id}
+    )
+    if servicios:
+        raise HTTPException(
+            status_code=409,
+            detail=f"No se puede borrar: tiene {servicios} servicio(s) en su historial. "
+                   "Puedes editar sus datos en su lugar.",
+        )
+
+    p = {"id": caregiver_id}
+    db.execute(text("DELETE FROM applications WHERE caregiver_id = :id"), p)
+    db.execute(text("DELETE FROM training_progress WHERE caregiver_id = :id"), p)
+    db.execute(text("DELETE FROM certifications WHERE caregiver_id = :id"), p)
+    db.execute(text("DELETE FROM service_ratings WHERE caregiver_id = :id"), p)
+    db.execute(
+        text("UPDATE requests SET cuidador_preferido_id = NULL WHERE cuidador_preferido_id = :id"), p
+    )
+    db.execute(text("DELETE FROM caregivers WHERE id = :id"), p)
+    auditar(db, "BORRAR", "caregivers", caregiver_id, u["id"])
+    db.commit()
+    return {"mensaje": "Cuidador eliminado"}
+
+
+@app.delete("/admin/requests/{request_id}")
+def admin_borrar_solicitud(
+    request_id: int,
+    u: dict = Depends(requiere("admin")),
+    db: Session = Depends(get_db),
+):
+    fila = consulta(
+        db, "SELECT caregiver_id FROM requests WHERE id = :id", {"id": request_id}
+    )
+    if not fila:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+
+    p = {"id": request_id}
+    db.execute(text("DELETE FROM service_ratings WHERE request_id = :id"), p)
+    db.execute(text("DELETE FROM applications WHERE request_id = :id"), p)
+    db.execute(text("DELETE FROM requests WHERE id = :id"), p)
+    if fila[0]["caregiver_id"] is not None:
+        _recalcular_calificacion(db, fila[0]["caregiver_id"])
+    auditar(db, "BORRAR", "requests", request_id, u["id"])
+    db.commit()
+    return {"mensaje": "Solicitud eliminada"}
 
 
 @app.get("/admin/users")

@@ -42,6 +42,15 @@ class CaregiverCreate(BaseModel):
     alcaldia: str = Field(min_length=1, max_length=80)
 
 
+class CaregiverUpdate(BaseModel):
+    """Edición por el administrador: solo se cambian los campos enviados."""
+    nombre: Optional[str] = Field(default=None, min_length=2, max_length=100)
+    experiencia: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    costo_hora: Optional[float] = Field(default=None, gt=0, le=5000)
+    especialidad: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    alcaldia: Optional[str] = Field(default=None, min_length=1, max_length=80)
+
+
 class RequestCreate(BaseModel):
     service_type: str = Field(min_length=1, max_length=100)
     alcaldia: str = Field(min_length=1, max_length=80)
