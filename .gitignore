@@ -1,0 +1,9 @@
+﻿PostgreSQL.txt
+.env
+*.env
+venv/
+__pycache__/
+*.pyc
+*.dump
+*.csv
+arreglar_cursos.py
