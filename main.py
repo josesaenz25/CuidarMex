@@ -24,7 +24,7 @@ from auth import (
     secreto_definido,
     verificar_password,
 )
-from database import SessionLocal
+from database import SessionLocal, engine
 from schemas import (
     ActivoUpdate,
     ApplicationCreate,
@@ -55,9 +55,13 @@ ORIGENES = [
     if o.strip()
 ] or ["*"]
 
-# Semáforo de cobertura: cuidadores registrados / cuidadores requeridos
-COBERTURA_ROJO = 10      # menos de 10 %  -> Rojo
-COBERTURA_AMARILLO = 50  # de 10 a 49 %   -> Amarillo; 50 % o más -> Verde
+# Modelo de planeación: 15 % de los adultos mayores requieren cuidado;
+# 1 cuidador recomendado por cada 5 personas que lo requieren.
+PCT_DEMANDA = 0.15
+PERSONAS_POR_CUIDADOR = 5
+# Semáforo por déficit % = (recomendados - oferta) / recomendados
+DEFICIT_ROJO = float(os.environ.get("DEFICIT_ROJO", "30"))        # más de 30 %  -> Rojo
+DEFICIT_AMARILLO = float(os.environ.get("DEFICIT_AMARILLO", "15"))  # 15 a 30 %    -> Amarillo; menos -> Verde
 
 VELOCIDAD_KMH = 22  # velocidad media urbana para estimar minutos de traslado
 
@@ -299,10 +303,48 @@ def _crear_admin_inicial():
         db.close()
 
 
+def _aplicar_modelo_planeacion():
+    """Aplica (una sola vez) el modelo de planeación si la base aún no lo tiene.
+
+    Es idempotente: si demanda_alcaldia ya está en 'planeacion_v1' no hace nada.
+    """
+    db = SessionLocal()
+    try:
+        col = valor(db, """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'demanda_alcaldia' AND column_name = 'modelo'
+        """)
+        if col is not None and not valor(
+            db, "SELECT COUNT(*) FROM demanda_alcaldia WHERE modelo <> 'planeacion_v1'"
+        ):
+            return
+    finally:
+        db.close()
+
+    ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fase1c_modelo_planeacion.sql")
+    with open(ruta, encoding="utf-8") as f:
+        sql = f.read()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)  # el script incluye su propio BEGIN/COMMIT
+        conn.commit()
+        logger.info("Modelo de planeación aplicado a demanda_alcaldia")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 @asynccontextmanager
 async def ciclo_de_vida(app: FastAPI):
     if EN_PRODUCCION and not secreto_definido():
         raise RuntimeError("Falta la variable de entorno JWT_SECRET")
+    try:
+        _aplicar_modelo_planeacion()
+    except Exception:
+        logger.exception("No se pudo aplicar el modelo de planeación (ejecuta fase1c_modelo_planeacion.sql)")
     try:
         _crear_admin_inicial()
     except Exception:
@@ -1223,6 +1265,21 @@ def obtener_oportunidades(
     return {"datos": datos}
 
 
+def cursos_pendientes(db: Session, cid: int) -> tuple:
+    """(completados, total) de los cursos activos de Capacitación para un cuidador."""
+    total = valor(db, "SELECT COUNT(*) FROM training_courses WHERE activo IS NOT FALSE") or 0
+    hechos = valor(
+        db,
+        """
+        SELECT COUNT(DISTINCT tp.course_id) FROM training_progress tp
+        JOIN training_courses tc ON tc.id = tp.course_id
+        WHERE tp.completado = TRUE AND tp.caregiver_id = :c AND tc.activo IS NOT FALSE
+        """,
+        {"c": cid},
+    ) or 0
+    return int(hechos), int(total)
+
+
 @app.post("/apply")
 def postularse(
     application: ApplicationCreate,
@@ -1230,6 +1287,18 @@ def postularse(
     db: Session = Depends(get_db),
 ):
     cid = cuidador_efectivo(u, application.caregiver_id, obligatorio=True)
+
+    # Candado: el cuidador debe completar TODOS los cursos antes de postularse
+    if u["rol"] == "cuidador":
+        hechos, total = cursos_pendientes(db, cid)
+        if hechos < total:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Para postularte primero completa todos los cursos de Capacitación "
+                    f"inteligente (llevas {hechos} de {total})."
+                ),
+            )
 
     solicitud = consulta(
         db, "SELECT status FROM requests WHERE id = :id", {"id": application.request_id}
@@ -1503,10 +1572,10 @@ def map_markers(u: dict = Depends(usuario_actual), db: Session = Depends(get_db)
     return {"solicitudes": solicitudes, "cuidadores": cuidadores}
 
 
-def semaforo_cobertura(pct: float) -> str:
-    if pct < COBERTURA_ROJO:
+def semaforo_deficit(deficit_pct: float) -> str:
+    if deficit_pct > DEFICIT_ROJO:
         return "Rojo"
-    if pct < COBERTURA_AMARILLO:
+    if deficit_pct >= DEFICIT_AMARILLO:
         return "Amarillo"
     return "Verde"
 
@@ -1515,8 +1584,10 @@ def semaforo_cobertura(pct: float) -> str:
 def coverage_summary(u: dict = Depends(usuario_actual), db: Session = Depends(get_db)):
     """Alcaldías ordenadas por MAYOR déficit de cuidadores.
 
-    Déficit = cuidadores requeridos - cuidadores registrados.
-    Cobertura = registrados / requeridos.
+    Oferta = oferta estimada base + cambios por uso de la app (altas/bajas de cuidadores).
+    Demanda = 15 % de adultos mayores + cambios por solicitudes registradas en la app.
+    Recomendados = personas que requieren cuidado / 5.
+    Déficit = recomendados - oferta; Déficit % = déficit / recomendados.
     """
     base = consulta(db, "SELECT * FROM demanda_alcaldia")
 
@@ -1537,6 +1608,14 @@ def coverage_summary(u: dict = Depends(usuario_actual), db: Session = Depends(ge
         k = clave_alcaldia(r["alcaldia"])
         pendientes[k] = pendientes.get(k, 0) + r["total"]
 
+    solicitudes_total: dict = {}
+    for r in consulta(db, """
+        SELECT alcaldia, COUNT(*) AS total FROM requests
+        WHERE alcaldia IS NOT NULL AND alcaldia <> '' GROUP BY alcaldia
+    """):
+        k = clave_alcaldia(r["alcaldia"])
+        solicitudes_total[k] = solicitudes_total.get(k, 0) + r["total"]
+
     categorias: dict = {}
     for r in consulta(db, "SELECT alcaldia, categoria, personas FROM demanda_categoria"):
         categorias.setdefault(r["alcaldia"], {})[r["categoria"]] = r["personas"]
@@ -1544,27 +1623,39 @@ def coverage_summary(u: dict = Depends(usuario_actual), db: Session = Depends(ge
     resultado = []
     for b in base:
         k = clave_alcaldia(b["alcaldia"])
-        requeridos = b["cuidadores_requeridos"]
         reg = registrados.get(k, 0)
-        deficit = requeridos - reg
-        cobertura = round(reg / requeridos * 100, 2) if requeridos else 100.0
+        # Solicitudes de la app suman demanda respecto a la línea base del modelo
+        total_sol = solicitudes_total.get(k, 0)
+        personas = max(0, b["personas_requieren_cuidado"] + total_sol - b.get("solicitudes_base", 0))
+        requeridos = math.ceil(personas / PERSONAS_POR_CUIDADOR)
+        # Oferta = base estimada + cuidadores registrados en la app
+        oferta = b.get("oferta_base", 0) + reg
+        deficit = max(0, requeridos - oferta)
+        deficit_pct = round(deficit / requeridos * 100, 1) if requeridos else 0.0
+        cobertura = round(min(100.0, oferta / requeridos * 100), 1) if requeridos else 100.0
 
         resultado.append({
             "alcaldia": b["alcaldia"],
-            "personas_requieren_cuidado": b["personas_requieren_cuidado"],
+            "personas_requieren_cuidado": personas,
             "adultos_mayores": b["adultos_mayores"],
             "medicos_generales": b["medicos_generales"],
             "especialistas": b["especialistas"],
             "cuidadores_requeridos": requeridos,
             "cuidadores_registrados": reg,
+            "oferta_estimada": oferta,
             "deficit": deficit,
+            "deficit_pct": deficit_pct,
             "cobertura_pct": cobertura,
-            "semaforo": semaforo_cobertura(cobertura),
+            "semaforo": semaforo_deficit(deficit_pct),
             "categorias": categorias.get(b["alcaldia"], {}),
             # Campos que ya usaba el mapa anterior:
             "solicitudes": pendientes.get(k, 0),
             "cuidadores": reg,
         })
+        try:
+            resultado[-1]["latitud"], resultado[-1]["longitud"] = coordenadas(b["alcaldia"])
+        except Exception:
+            pass
 
     resultado.sort(key=lambda x: (-x["deficit"], x["alcaldia"]))
     return {"datos": resultado}
